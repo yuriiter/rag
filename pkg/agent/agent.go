@@ -1,0 +1,596 @@
+package agent
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+
+	"github.com/yuriiter/rag/pkg/config"
+	"github.com/yuriiter/rag/pkg/rag"
+	"github.com/yuriiter/rag/pkg/tools"
+	"github.com/yuriiter/rag/pkg/ui"
+
+	openai "github.com/sashabaranov/go-openai"
+)
+
+type Agent struct {
+	client      *openai.Client
+	config      config.Config
+	history     []openai.ChatCompletionMessage
+	Registry    *tools.Registry
+	RagEngine   *rag.Engine
+	agenticMode bool
+}
+
+func New(cfg config.Config, agenticMode bool, mcpServers []string) (*Agent, error) {
+	clientConfig := openai.DefaultConfig(cfg.ApiKey)
+	if cfg.BaseURL != "" {
+		clientConfig.BaseURL = cfg.BaseURL
+	}
+
+	client := openai.NewClientWithConfig(clientConfig)
+	reg := tools.NewRegistry()
+
+	if agenticMode {
+		for _, serverCmd := range mcpServers {
+			if serverCmd == "" {
+				continue
+			}
+			fmt.Printf("%sConnecting to MCP: %s...%s\n", ui.ColorBlue, serverCmd, ui.ColorReset)
+			if err := reg.LoadMCPTools(serverCmd); err != nil {
+				return nil, fmt.Errorf("failed to load MCP server '%s': %w", serverCmd, err)
+			}
+		}
+
+		toolsList := reg.GetOpenAITools()
+		var names []string
+		for _, t := range toolsList {
+			names = append(names, t.Function.Name)
+		}
+		if len(names) > 0 {
+			fmt.Printf("%sLoaded Tools: %s%s\n", ui.ColorGreen, strings.Join(names, ", "), ui.ColorReset)
+		}
+	}
+
+	sysPrompt := cfg.SystemInstructions
+	if sysPrompt == "" {
+		if agenticMode {
+			sysPrompt = "You are a helpful assistant with access to tools.\n" +
+				"IMPORTANT GUIDELINES FOR TOOL USE:\n" +
+				"1. Use tools only when needed. For general conversation or greetings, do not use tools.\n" +
+				"2. FORMATTING IS CRITICAL: When calling a tool, use ONLY the tool name (e.g., 'get_weather').\n" +
+				"   NEVER append JSON arguments to the tool name.\n" +
+				"   Put all arguments inside the JSON arguments object.\n" +
+				"3. Do not guess argument values.\n" +
+				"4. Always provide all required parameters defined in the tool schema."
+		} else {
+			sysPrompt = "You are a helpful assistant."
+		}
+	}
+
+	ragEngine, err := rag.New()
+	if err != nil {
+		return nil, fmt.Errorf("failed to init RAG engine: %w", err)
+	}
+
+	agent := &Agent{
+		client:      client,
+		config:      cfg,
+		history:     make([]openai.ChatCompletionMessage, 0),
+		Registry:    reg,
+		agenticMode: agenticMode,
+		RagEngine:   ragEngine,
+	}
+
+	if sysPrompt != "" {
+		agent.history = append(agent.history, openai.ChatCompletionMessage{
+			Role:    openai.ChatMessageRoleSystem,
+			Content: sysPrompt,
+		})
+	}
+
+	return agent, nil
+}
+
+func (a *Agent) getAttachmentURIs() ([]string, error) {
+	if len(a.config.AttachGlobs) == 0 {
+		return nil, nil
+	}
+	files := rag.FindFiles(a.config.AttachGlobs)
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no files found matching patterns: %v", a.config.AttachGlobs)
+	}
+
+	var uris []string
+	for _, f := range files {
+		uri, err := fileToDataURI(f)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read attached file %s: %w", f, err)
+		}
+		uris = append(uris, uri)
+		fmt.Printf("%sAttached file: %s%s\n", ui.ColorBlue, f, ui.ColorReset)
+	}
+	return uris, nil
+}
+
+func fileToDataURI(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	ext := strings.ToLower(filepath.Ext(path))
+	mime := "application/octet-stream"
+
+	switch ext {
+	case ".png":
+		mime = "image/png"
+	case ".jpg", ".jpeg":
+		mime = "image/jpeg"
+	case ".webp":
+		mime = "image/webp"
+	case ".pdf":
+		mime = "application/pdf"
+	case ".csv":
+		mime = "text/csv"
+	case ".txt", ".md":
+		mime = "text/plain"
+	}
+
+	b64 := base64.StdEncoding.EncodeToString(b)
+	return fmt.Sprintf("data:%s;base64,%s", mime, b64), nil
+}
+
+func (a *Agent) GenerateImage(ctx context.Context, prompt string, outputPath string) error {
+	attachedURIs, err := a.getAttachmentURIs()
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("%sInitiating Image Generation...%s\n", ui.ColorBlue, ui.ColorReset)
+
+	reqBody := map[string]interface{}{
+		"prompt":          prompt,
+		"model":           a.config.ImageModel,
+		"size":            a.config.ImageSize,
+		"response_format": "b64_json",
+		"n":               1,
+	}
+
+	if len(attachedURIs) > 0 {
+		reqBody["files"] = attachedURIs
+	}
+
+	b, err := json.Marshal(reqBody)
+	if err != nil {
+		return err
+	}
+
+	baseURL := a.config.BaseURL
+	if baseURL == "" {
+		baseURL = "https://api.openai.com/v1"
+	}
+	url := strings.TrimRight(baseURL, "/") + "/images/generations"
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if a.config.ApiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+a.config.ApiKey)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("http request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("API error (%d): %s", resp.StatusCode, string(respBytes))
+	}
+
+	var result struct {
+		Data []struct {
+			B64JSON string `json:"b64_json"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal(respBytes, &result); err != nil {
+		return fmt.Errorf("failed to parse JSON response: %w", err)
+	}
+
+	if len(result.Data) == 0 || result.Data[0].B64JSON == "" {
+		return fmt.Errorf("no image data returned")
+	}
+
+	imgData, err := base64.StdEncoding.DecodeString(result.Data[0].B64JSON)
+	if err != nil {
+		return fmt.Errorf("failed to decode base64 image: %w", err)
+	}
+
+	if err := os.WriteFile(outputPath, imgData, 0644); err != nil {
+		return fmt.Errorf("failed to write image to %s: %w", outputPath, err)
+	}
+
+	fmt.Printf("%sImage successfully saved to %s%s\n", ui.ColorGreen, outputPath, ui.ColorReset)
+	return nil
+}
+
+func (a *Agent) LoadContextFiles(ctx context.Context, globs []string) error {
+	if len(globs) == 0 {
+		return nil
+	}
+	files := rag.FindFiles(globs)
+	if len(files) == 0 {
+		return fmt.Errorf("no files found matching globs: %v", globs)
+	}
+
+	fmt.Printf("%sLoading context from %d files...%s\n", ui.ColorBlue, len(files), ui.ColorReset)
+
+	var sb strings.Builder
+	sb.WriteString("CONTEXT FROM FILES:\n\n")
+
+	for _, file := range files {
+		content, err := rag.ExtractText(file)
+		if err != nil {
+			fmt.Printf("Warning: Failed to read %s: %v\n", file, err)
+			continue
+		}
+		if strings.TrimSpace(content) == "" {
+			continue
+		}
+		sb.WriteString(fmt.Sprintf("--- FILE: %s ---\n%s\n\n", file, content))
+	}
+
+	a.AddContext(sb.String())
+	return nil
+}
+
+func (a *Agent) AddContext(content string) {
+	a.history = append(a.history, openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleUser,
+		Content: content,
+	})
+}
+
+func (a *Agent) SaveSession(filename string) error {
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	fmt.Fprintf(f, "# Chat Session\n\n")
+
+	for _, msg := range a.history {
+		role := msg.Role
+		content := msg.Content
+
+		if content == "" && len(msg.MultiContent) > 0 {
+			content = "[MultiContent/Vision payload attached]"
+		}
+
+		if len(msg.ToolCalls) > 0 {
+			var calls []string
+			for _, tc := range msg.ToolCalls {
+				calls = append(calls, fmt.Sprintf("Tool Call: %s(%s)", tc.Function.Name, tc.Function.Arguments))
+			}
+			if content != "" {
+				content += "\n\n"
+			}
+			content += fmt.Sprintf("`%s`", strings.Join(calls, ", "))
+		}
+
+		fmt.Fprintf(f, "## role: %s\n%s\n\n", role, content)
+	}
+	return nil
+}
+
+func (a *Agent) LoadSession(filename string) error {
+	contentBytes, err := os.ReadFile(filename)
+	if err != nil {
+		return err
+	}
+	content := string(contentBytes)
+
+	var newHistory []openai.ChatCompletionMessage
+	lines := strings.Split(content, "\n")
+
+	roleRegex := regexp.MustCompile(`^## role:\s*(\w+)`)
+
+	var currentRole string
+	var currentContentBuilder strings.Builder
+
+	flush := func() {
+		if currentRole != "" {
+			text := strings.TrimSpace(currentContentBuilder.String())
+			if text != "" || currentRole == openai.ChatMessageRoleAssistant {
+				newHistory = append(newHistory, openai.ChatCompletionMessage{
+					Role:    currentRole,
+					Content: text,
+				})
+			}
+		}
+	}
+
+	for _, line := range lines {
+		if match := roleRegex.FindStringSubmatch(line); len(match) > 1 {
+			flush()
+			currentRole = match[1]
+			currentContentBuilder.Reset()
+			continue
+		}
+
+		if strings.HasPrefix(line, "# ") && !strings.HasPrefix(line, "## role:") {
+			continue
+		}
+
+		if currentRole != "" {
+			currentContentBuilder.WriteString(line + "\n")
+		}
+	}
+	flush()
+
+	if len(newHistory) > 0 {
+		a.history = newHistory
+	}
+
+	return nil
+}
+
+func (a *Agent) InitializeRAG(ctx context.Context) error {
+	if len(a.config.RagGlobs) == 0 {
+		return nil
+	}
+
+	cachePath := rag.GetDefaultCachePath(a.config.RagGlobs)
+
+	if a.RagEngine.CacheExists(cachePath) {
+		fmt.Printf("%sFound embedding cache, validating...%s\n", ui.ColorBlue, ui.ColorReset)
+
+		valid, reason := a.RagEngine.ValidateCache(cachePath, a.config.RagGlobs)
+
+		if valid {
+			fmt.Printf("%sCache is valid, loading...%s\n", ui.ColorGreen, ui.ColorReset)
+			if _, err := a.RagEngine.LoadEmbeddings(cachePath); err != nil {
+				fmt.Printf("%sCache load failed: %v, regenerating...%s\n", ui.ColorRed, err, ui.ColorReset)
+			} else {
+				return nil
+			}
+		} else {
+			fmt.Printf("%sCache is stale: %s%s\n", ui.ColorRed, reason, ui.ColorReset)
+			fmt.Printf("%sRegenerating embeddings...%s\n", ui.ColorBlue, ui.ColorReset)
+		}
+	} else {
+		fmt.Printf("%sNo cache found, generating embeddings...%s\n", ui.ColorBlue, ui.ColorReset)
+	}
+
+	if err := a.RagEngine.IngestGlobs(ctx, a.config.RagGlobs); err != nil {
+		return err
+	}
+
+	if err := a.RagEngine.SaveEmbeddings(cachePath, a.config.RagGlobs); err != nil {
+		fmt.Printf("%sWarning: Failed to save cache: %v%s\n", ui.ColorRed, err, ui.ColorReset)
+	}
+
+	return nil
+}
+
+func (a *Agent) Close() {
+	if a.Registry != nil {
+		a.Registry.Close()
+	}
+}
+
+func (a *Agent) pruneHistory() {
+	const maxHistory = 10
+	if len(a.history) <= maxHistory {
+		return
+	}
+
+	var newHistory []openai.ChatCompletionMessage
+	if len(a.history) > 0 && a.history[0].Role == openai.ChatMessageRoleSystem {
+		newHistory = append(newHistory, a.history[0])
+		remaining := a.history[len(a.history)-(maxHistory-1):]
+		newHistory = append(newHistory, remaining...)
+	} else {
+		newHistory = a.history[len(a.history)-maxHistory:]
+	}
+	a.history = newHistory
+}
+
+func (a *Agent) generateSearchKeywords(ctx context.Context, userQuery string) string {
+	fmt.Printf("%sGenerating search keywords...%s ", ui.ColorBlue, ui.ColorReset)
+
+	req := openai.ChatCompletionRequest{
+		Model: a.config.Model,
+		Messages: []openai.ChatCompletionMessage{
+			{
+				Role: openai.ChatMessageRoleSystem,
+				Content: "You are a retrieval assistant. Your goal is to rewrite the user's input into a concise, information-dense search query for a vector database. " +
+					"Remove conversational filler. Keep all technical terms, names, and specific requirements. " +
+					"Output ONLY the distilled search text."},
+			{
+				Role:    openai.ChatMessageRoleUser,
+				Content: userQuery,
+			},
+		},
+		Temperature: 0.2,
+		MaxTokens:   150,
+	}
+
+	resp, err := a.client.CreateChatCompletion(ctx, req)
+	if err != nil || len(resp.Choices) == 0 {
+		fmt.Println("(failed, using original query)")
+		return userQuery
+	}
+
+	keywords := strings.TrimSpace(resp.Choices[0].Message.Content)
+	fmt.Printf("[%s]\n", keywords)
+	return keywords
+}
+
+func (a *Agent) RunTurnCapture(ctx context.Context, prompt string) (string, error) {
+	var capturedOutput strings.Builder
+
+	err := a.runTurnInternal(ctx, prompt, func(s string) {
+		capturedOutput.WriteString(s)
+		fmt.Print(s)
+	})
+
+	if err != nil {
+		return "", err
+	}
+	return capturedOutput.String(), nil
+}
+
+func (a *Agent) RunTurn(ctx context.Context, prompt string, streaming bool) error {
+	return a.runTurnInternal(ctx, prompt, func(s string) {
+		ui.PrintAgentMessage(s)
+	})
+}
+
+func (a *Agent) runTurnInternal(ctx context.Context, prompt string, printFn func(string)) error {
+	historyStartLen := len(a.history)
+
+	defer func() {
+		if !a.config.RetainHistory {
+			a.history = a.history[:historyStartLen]
+		}
+	}()
+
+	a.pruneHistory()
+
+	finalPrompt := prompt
+
+	if len(a.config.RagGlobs) > 0 && len(a.RagEngine.Chunks) > 0 {
+		searchQuery := a.generateSearchKeywords(ctx, prompt)
+
+		results, err := a.RagEngine.Search(ctx, searchQuery, a.config.RagTopK)
+		if err != nil {
+			fmt.Printf("%sRAG Search Error: %v%s\n", ui.ColorRed, err, ui.ColorReset)
+		} else if len(results) > 0 {
+			var contextBuilder strings.Builder
+			contextBuilder.WriteString("Use the following context to answer the user's question:\n\n")
+			for _, r := range results {
+				contextBuilder.WriteString(fmt.Sprintf("--- Source: %s ---\n%s\n\n", r.Filename, r.Text))
+			}
+			contextBuilder.WriteString("User Question: " + prompt)
+			finalPrompt = contextBuilder.String()
+			fmt.Printf("%sFound %d relevant context chunks.%s\n", ui.ColorGreen, len(results), ui.ColorReset)
+		}
+	}
+
+	attachedURIs, err := a.getAttachmentURIs()
+	if err != nil {
+		fmt.Printf("%sWarning: failed to attach files: %v%s\n", ui.ColorRed, err, ui.ColorReset)
+	}
+
+	var userMsg openai.ChatCompletionMessage
+	if len(attachedURIs) > 0 {
+		parts := []openai.ChatMessagePart{
+			{
+				Type: openai.ChatMessagePartTypeText,
+				Text: finalPrompt,
+			},
+		}
+		for _, uri := range attachedURIs {
+			parts = append(parts, openai.ChatMessagePart{
+				Type: openai.ChatMessagePartTypeImageURL,
+				ImageURL: &openai.ChatMessageImageURL{
+					URL: uri,
+				},
+			})
+		}
+		userMsg = openai.ChatCompletionMessage{
+			Role:         openai.ChatMessageRoleUser,
+			MultiContent: parts,
+		}
+	} else {
+		userMsg = openai.ChatCompletionMessage{
+			Role:    openai.ChatMessageRoleUser,
+			Content: finalPrompt,
+		}
+	}
+	a.history = append(a.history, userMsg)
+
+	maxSteps := a.config.MaxSteps
+	if !a.agenticMode {
+		maxSteps = 1
+	}
+
+	steps := 0
+	for steps < maxSteps {
+		req := openai.ChatCompletionRequest{
+			Model:       a.config.Model,
+			Messages:    a.history,
+			Temperature: a.config.Temperature,
+		}
+
+		if a.agenticMode {
+			availTools := a.Registry.GetOpenAITools()
+			if len(availTools) > 0 {
+				req.Tools = availTools
+			}
+		}
+
+		resp, err := a.client.CreateChatCompletion(ctx, req)
+		if err != nil {
+			return fmt.Errorf("api error: %w", err)
+		}
+
+		if len(resp.Choices) == 0 {
+			return fmt.Errorf("api returned empty response (no choices)")
+		}
+
+		msg := resp.Choices[0].Message
+		a.history = append(a.history, msg)
+
+		if len(msg.ToolCalls) > 0 && a.agenticMode {
+			ui.PrintToolUse(msg.ToolCalls[0].Function.Name, msg.ToolCalls[0].Function.Arguments)
+
+			for _, toolCall := range msg.ToolCalls {
+				cleanName := strings.Split(toolCall.Function.Name, "{")[0]
+				cleanName = strings.Split(cleanName, "=")[0]
+				cleanName = strings.TrimSpace(cleanName)
+
+				output, err := a.Registry.Execute(cleanName, toolCall.Function.Arguments)
+				if err != nil {
+					output = fmt.Sprintf("Error executing tool: %v", err)
+				}
+
+				if len(output) > 10000 {
+					output = output[:10000] + "\n...(truncated output)"
+				}
+
+				a.history = append(a.history, openai.ChatCompletionMessage{
+					Role:       openai.ChatMessageRoleTool,
+					Content:    output,
+					ToolCallID: toolCall.ID,
+				})
+			}
+			steps++
+			continue
+		}
+
+		printFn(msg.Content + "\n")
+		return nil
+	}
+
+	return errors.New("agent step limit reached")
+}
