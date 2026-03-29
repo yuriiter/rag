@@ -115,12 +115,32 @@ func (e *Engine) Ingest(ctx context.Context, sources []string, chunkSize, overla
 
 	var textsToEmbed []string
 	var mapIndexToMeta []struct{ Text, Source string }
+	sourceMTime := make(map[string]int64)
 
 	for i, target := range targets {
+		var mtime int64
+		if strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://") {
+			mtime = 0
+		} else {
+			info, err := os.Stat(target)
+			if err != nil {
+				continue
+			}
+			mtime = info.ModTime().UnixNano()
+		}
+		sourceMTime[target] = mtime
+
+		cachedChunks, ok := loadCache(target, mtime)
+		if ok {
+			progress(fmt.Sprintf("Loading %s from cache (%d/%d)...", filepath.Base(target), i+1, len(targets)))
+			e.Chunks = append(e.Chunks, cachedChunks...)
+			continue
+		}
+
 		progress(fmt.Sprintf("Extracting %s (%d/%d)...", filepath.Base(target), i+1, len(targets)))
 		content, err := ExtractContent(target)
 		if err != nil {
-			continue // skip unreadable files
+			continue
 		}
 
 		content = cleanText(content)
@@ -136,17 +156,22 @@ func (e *Engine) Ingest(ctx context.Context, sources []string, chunkSize, overla
 	}
 
 	if len(textsToEmbed) == 0 {
-		return fmt.Errorf("no text content extracted from sources")
+		if len(e.Chunks) == 0 {
+			return fmt.Errorf("no text content extracted from sources")
+		}
+		return nil
 	}
 
 	batchSize := 100
+	newChunksBySource := make(map[string][]Chunk)
+
 	for i := 0; i < len(textsToEmbed); i += batchSize {
 		end := i + batchSize
 		if end > len(textsToEmbed) {
 			end = len(textsToEmbed)
 		}
 
-		progress(fmt.Sprintf("Embedding chunk %d of %d...", end, len(textsToEmbed)))
+		progress(fmt.Sprintf("Running AI model on new chunks %d/%d...", end, len(textsToEmbed)))
 
 		batch := textsToEmbed[i:end]
 		vectors, err := e.embed(ctx, batch)
@@ -159,12 +184,19 @@ func (e *Engine) Ingest(ctx context.Context, sources []string, chunkSize, overla
 				continue
 			}
 			meta := mapIndexToMeta[i+j]
-			e.Chunks = append(e.Chunks, Chunk{
+			newChunk := Chunk{
 				Text:   meta.Text,
 				Source: meta.Source,
 				Vector: vec,
-			})
+			}
+			e.Chunks = append(e.Chunks, newChunk)
+			newChunksBySource[meta.Source] = append(newChunksBySource[meta.Source], newChunk)
 		}
+	}
+
+	progress("Saving vectors to local cache...")
+	for src, chunks := range newChunksBySource {
+		saveCache(src, sourceMTime[src], chunks)
 	}
 
 	return nil

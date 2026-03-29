@@ -13,9 +13,10 @@ import (
 )
 
 var (
-	topK      int
-	chunkSize int
-	overlap   int
+	topK       int
+	chunkSize  int
+	overlap    int
+	clearCache bool
 )
 
 func main() {
@@ -25,17 +26,14 @@ func main() {
 		Long: `Local Semantic Search CLI
 
 Search over your documents and web pages using local vector embeddings.
-Understand the *meaning* of your query rather than relying on exact keyword matches.
-
-Example:
-  rag "how does error handling work?" ./docs/*.pdf https://example.com/api-docs`,
-		Args: cobra.MinimumNArgs(2),
-		Run:  runSearch,
+Understand the *meaning* of your query rather than relying on exact keyword matches.`,
+		Run: runSearch,
 	}
 
 	rootCmd.Flags().IntVarP(&topK, "topK", "k", 3, "Number of top results to return")
-	rootCmd.Flags().IntVar(&chunkSize, "chunk", 800, "The number of characters per text chunk")
-	rootCmd.Flags().IntVar(&overlap, "overlap", 100, "The number of overlapping characters between chunks")
+	rootCmd.Flags().IntVar(&chunkSize, "chunk", 800, "Characters per text chunk")
+	rootCmd.Flags().IntVar(&overlap, "overlap", 100, "Overlapping characters between chunks")
+	rootCmd.Flags().BoolVar(&clearCache, "clear-cache", false, "Clear the local embedding cache")
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -43,6 +41,19 @@ Example:
 }
 
 func runSearch(cmd *cobra.Command, args []string) {
+	if clearCache {
+		clearCacheDir()
+		color.Green("✅ Cache cleared successfully.")
+		if len(args) == 0 {
+			return
+		}
+	}
+
+	if len(args) < 2 {
+		cmd.Help()
+		os.Exit(1)
+	}
+
 	query := args[0]
 	sources := args[1:]
 
