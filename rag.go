@@ -132,7 +132,8 @@ func (e *Engine) Ingest(ctx context.Context, sources []string, chunkSize, overla
 		}
 		content = cleanText(content)
 
-		hashBytes := sha256.Sum256([]byte(content))
+		hashInput := fmt.Sprintf("%s|%d|%d", content, chunkSize, overlap)
+		hashBytes := sha256.Sum256([]byte(hashInput))
 		contentHash := hex.EncodeToString(hashBytes[:])
 
 		cachedChunks, ok := loadCache(contentHash)
