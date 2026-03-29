@@ -36,7 +36,7 @@ type Engine struct {
 }
 
 func NewEngine() (*Engine, error) {
-	zerolog.SetGlobalLevel(zerolog.WarnLevel)
+	zerolog.SetGlobalLevel(zerolog.FatalLevel)
 
 	model, err := tasks.Load[textencoding.Interface](&tasks.Config{
 		ModelsDir: filepath.Join(os.Getenv("HOME"), ".cybertron"),
@@ -78,7 +78,6 @@ func (e *Engine) embed(ctx context.Context, texts []string) ([][]float32, error)
 						output, err = e.model.Encode(ctx, j.text[:512], int(bert.MeanPooling))
 					}
 					if err != nil {
-						fmt.Printf("\nWarning: Skipping chunk %d due to encoding error: %v\n", j.index, err)
 						continue
 					}
 				}
@@ -99,7 +98,7 @@ func (e *Engine) embed(ctx context.Context, texts []string) ([][]float32, error)
 	return results, nil
 }
 
-func (e *Engine) Ingest(ctx context.Context, sources []string, chunkSize, overlap int) error {
+func (e *Engine) Ingest(ctx context.Context, sources []string, chunkSize, overlap int, progress func(string)) error {
 	var targets []string
 
 	for _, src := range sources {
@@ -114,16 +113,14 @@ func (e *Engine) Ingest(ctx context.Context, sources []string, chunkSize, overla
 		return fmt.Errorf("no valid files or URLs found")
 	}
 
-	fmt.Printf("Processing %d sources...\n", len(targets))
-
 	var textsToEmbed []string
 	var mapIndexToMeta []struct{ Text, Source string }
 
 	for i, target := range targets {
+		progress(fmt.Sprintf("Extracting %s (%d/%d)...", filepath.Base(target), i+1, len(targets)))
 		content, err := ExtractContent(target)
 		if err != nil {
-			fmt.Printf("\rSkipping %s: %v\n", target, err)
-			continue
+			continue // skip unreadable files
 		}
 
 		content = cleanText(content)
@@ -136,22 +133,20 @@ func (e *Engine) Ingest(ctx context.Context, sources []string, chunkSize, overla
 			textsToEmbed = append(textsToEmbed, c)
 			mapIndexToMeta = append(mapIndexToMeta, struct{ Text, Source string }{Text: c, Source: target})
 		}
-		fmt.Printf("\rProcessed %d/%d sources...", i+1, len(targets))
 	}
-	fmt.Println()
 
 	if len(textsToEmbed) == 0 {
 		return fmt.Errorf("no text content extracted from sources")
 	}
 
-	fmt.Printf("Generating embeddings for %d chunks...\n", len(textsToEmbed))
 	batchSize := 100
-
 	for i := 0; i < len(textsToEmbed); i += batchSize {
 		end := i + batchSize
 		if end > len(textsToEmbed) {
 			end = len(textsToEmbed)
 		}
+
+		progress(fmt.Sprintf("Embedding chunk %d of %d...", end, len(textsToEmbed)))
 
 		batch := textsToEmbed[i:end]
 		vectors, err := e.embed(ctx, batch)
@@ -170,9 +165,7 @@ func (e *Engine) Ingest(ctx context.Context, sources []string, chunkSize, overla
 				Vector: vec,
 			})
 		}
-		fmt.Printf("\rProgress: %.1f%% (%d/%d chunks)", float64(end)/float64(len(textsToEmbed))*100, end, len(textsToEmbed))
 	}
-	fmt.Println("\nDone.")
 
 	return nil
 }

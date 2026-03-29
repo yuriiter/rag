@@ -2,52 +2,111 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"os"
+	"strings"
+	"time"
+
+	"github.com/briandowns/spinner"
+	"github.com/fatih/color"
+	"github.com/spf13/cobra"
+)
+
+var (
+	topK      int
+	chunkSize int
+	overlap   int
 )
 
 func main() {
-	topK := flag.Int("k", 3, "Number of top results to return")
-	chunkSize := flag.Int("chunk", 800, "Chunk size for text splitting")
-	overlap := flag.Int("overlap", 100, "Overlap size for text splitting")
-	flag.Parse()
+	rootCmd := &cobra.Command{
+		Use:   "rag <search_term> <file_or_glob_or_url...>",
+		Short: "A local, completely private Semantic Search CLI.",
+		Long: `Local Semantic Search CLI
 
-	args := flag.Args()
-	if len(args) < 2 {
-		fmt.Println("Usage: rag [flags] <search_term> <file_or_glob_or_url...>")
-		fmt.Println("Example: rag -k 5 \"machine learning\" ./docs/*.pdf https://example.com/article")
-		os.Exit(1)
+Search over your documents and web pages using local vector embeddings.
+Understand the *meaning* of your query rather than relying on exact keyword matches.
+
+Example:
+  rag "how does error handling work?" ./docs/*.pdf https://example.com/api-docs`,
+		Args: cobra.MinimumNArgs(2),
+		Run:  runSearch,
 	}
 
+	rootCmd.Flags().IntVarP(&topK, "topK", "k", 3, "Number of top results to return")
+	rootCmd.Flags().IntVar(&chunkSize, "chunk", 800, "The number of characters per text chunk")
+	rootCmd.Flags().IntVar(&overlap, "overlap", 100, "The number of overlapping characters between chunks")
+
+	if err := rootCmd.Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+func runSearch(cmd *cobra.Command, args []string) {
 	query := args[0]
 	sources := args[1:]
 
-	fmt.Println("Initializing local embedding model (downloading if needed)...")
+	cyan := color.New(color.FgCyan, color.Bold)
+	yellow := color.New(color.FgYellow)
+	magenta := color.New(color.FgMagenta, color.Bold)
+	green := color.New(color.FgGreen, color.Bold)
+
+	fmt.Println()
+	cyan.Println("🧠 Local Semantic Search")
+	fmt.Println(strings.Repeat("-", 40))
+
+	s := spinner.New(spinner.CharSets[14], 100*time.Millisecond)
+	s.Color("cyan")
+
+	s.Suffix = " Initializing local AI model (downloading to ~/.cybertron if needed)..."
+	s.Start()
+
 	engine, err := NewEngine()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to init RAG engine: %v\n", err)
+		s.Stop()
+		color.Red("Failed to init RAG engine: %v\n", err)
 		os.Exit(1)
 	}
 
 	ctx := context.Background()
 
-	if err := engine.Ingest(ctx, sources, *chunkSize, *overlap); err != nil {
-		fmt.Fprintf(os.Stderr, "Error ingesting documents: %v\n", err)
-		os.Exit(1)
-	}
+	s.Suffix = " Ingesting & embedding documents..."
 
-	fmt.Printf("\nSearching for: \"%s\"\n", query)
-	results, err := engine.Search(ctx, query, *topK)
+	err = engine.Ingest(ctx, sources, chunkSize, overlap, func(msg string) {
+		s.Suffix = fmt.Sprintf(" %s", msg)
+	})
+
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Search error: %v\n", err)
+		s.Stop()
+		color.Red("\nError ingesting documents: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("\n=== Top %d Results ===\n", *topK)
+	s.Suffix = fmt.Sprintf(" Searching for: \"%s\"...", query)
+	results, err := engine.Search(ctx, query, topK)
+	s.Stop()
+
+	if err != nil {
+		color.Red("\nSearch error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println()
+	cyan.Printf("🎯 Top %d Results for \"%s\"\n", len(results), query)
+	fmt.Println(strings.Repeat("=", 60))
+
 	for i, res := range results {
-		fmt.Printf("\n--- Result %d (Score: %.4f) ---\n", i+1, res.Score)
-		fmt.Printf("Source: %s\n", res.Chunk.Source)
-		fmt.Printf("Text:\n%s\n", res.Chunk.Text)
+		header := magenta.Sprintf("Result %d", i+1)
+		score := green.Sprintf("[Score: %.4f]", res.Score)
+		sourceInfo := yellow.Sprintf("File/URL: %s", res.Chunk.Source)
+
+		fmt.Printf("%s %s\n%s\n\n", header, score, sourceInfo)
+
+		lines := strings.Split(strings.TrimSpace(res.Chunk.Text), "\n")
+		for _, line := range lines {
+			fmt.Printf("  │ %s\n", line)
+		}
+
+		fmt.Println(strings.Repeat("-", 60))
 	}
 }
