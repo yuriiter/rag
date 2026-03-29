@@ -22,10 +22,7 @@ Instead of searching for exact keyword matches like `grep`, this tool uses local
 Clone the repository, fetch dependencies, and build the binary:
 
 ```bash
-git clone <your-repo-url>
-cd semantic-search
-go mod tidy
-go install .
+go install github.com/yuriiter/rag@latest
 ```
 *(This will install the binary to your `$GOPATH/bin`, usually `~/go/bin`. Make sure this is in your system's `$PATH`.)*
 
