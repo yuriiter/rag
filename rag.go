@@ -1,0 +1,243 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
+
+	"github.com/nlpodyssey/cybertron/pkg/models/bert"
+	"github.com/nlpodyssey/cybertron/pkg/tasks"
+	"github.com/nlpodyssey/cybertron/pkg/tasks/textencoding"
+	"github.com/rs/zerolog"
+)
+
+type Chunk struct {
+	Text   string
+	Source string
+	Vector []float32
+}
+
+type ScoredChunk struct {
+	Chunk Chunk
+	Score float64
+}
+
+type Engine struct {
+	model  textencoding.Interface
+	mu     sync.Mutex
+	Chunks []Chunk
+}
+
+func NewEngine() (*Engine, error) {
+	zerolog.SetGlobalLevel(zerolog.WarnLevel)
+
+	model, err := tasks.Load[textencoding.Interface](&tasks.Config{
+		ModelsDir: filepath.Join(os.Getenv("HOME"), ".cybertron"),
+		ModelName: "sentence-transformers/all-MiniLM-L6-v2",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to load local model: %w", err)
+	}
+
+	return &Engine{
+		model:  model,
+		Chunks: make([]Chunk, 0),
+	}, nil
+}
+
+func (e *Engine) embed(ctx context.Context, texts []string) ([][]float32, error) {
+	results := make([][]float32, len(texts))
+	numWorkers := runtime.NumCPU()
+	if len(texts) < numWorkers {
+		numWorkers = len(texts)
+	}
+
+	type job struct {
+		index int
+		text  string
+	}
+
+	jobs := make(chan job, len(texts))
+	var wg sync.WaitGroup
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				output, err := e.model.Encode(ctx, j.text, int(bert.MeanPooling))
+				if err != nil {
+					if len(j.text) > 512 {
+						output, err = e.model.Encode(ctx, j.text[:512], int(bert.MeanPooling))
+					}
+					if err != nil {
+						fmt.Printf("\nWarning: Skipping chunk %d due to encoding error: %v\n", j.index, err)
+						continue
+					}
+				}
+
+				e.mu.Lock()
+				results[j.index] = output.Vector.Data().F32()
+				e.mu.Unlock()
+			}
+		}()
+	}
+
+	for i, text := range texts {
+		jobs <- job{index: i, text: text}
+	}
+	close(jobs)
+	wg.Wait()
+
+	return results, nil
+}
+
+func (e *Engine) Ingest(ctx context.Context, sources []string, chunkSize, overlap int) error {
+	var targets []string
+
+	for _, src := range sources {
+		if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
+			targets = append(targets, src)
+		} else {
+			targets = append(targets, FindFiles(src)...)
+		}
+	}
+
+	if len(targets) == 0 {
+		return fmt.Errorf("no valid files or URLs found")
+	}
+
+	fmt.Printf("Processing %d sources...\n", len(targets))
+
+	var textsToEmbed []string
+	var mapIndexToMeta []struct{ Text, Source string }
+
+	for i, target := range targets {
+		content, err := ExtractContent(target)
+		if err != nil {
+			fmt.Printf("\rSkipping %s: %v\n", target, err)
+			continue
+		}
+
+		content = cleanText(content)
+		if content == "" {
+			continue
+		}
+
+		chunks := chunkText(content, chunkSize, overlap)
+		for _, c := range chunks {
+			textsToEmbed = append(textsToEmbed, c)
+			mapIndexToMeta = append(mapIndexToMeta, struct{ Text, Source string }{Text: c, Source: target})
+		}
+		fmt.Printf("\rProcessed %d/%d sources...", i+1, len(targets))
+	}
+	fmt.Println()
+
+	if len(textsToEmbed) == 0 {
+		return fmt.Errorf("no text content extracted from sources")
+	}
+
+	fmt.Printf("Generating embeddings for %d chunks...\n", len(textsToEmbed))
+	batchSize := 100
+
+	for i := 0; i < len(textsToEmbed); i += batchSize {
+		end := i + batchSize
+		if end > len(textsToEmbed) {
+			end = len(textsToEmbed)
+		}
+
+		batch := textsToEmbed[i:end]
+		vectors, err := e.embed(ctx, batch)
+		if err != nil {
+			return fmt.Errorf("embedding error: %w", err)
+		}
+
+		for j, vec := range vectors {
+			if len(vec) == 0 {
+				continue
+			}
+			meta := mapIndexToMeta[i+j]
+			e.Chunks = append(e.Chunks, Chunk{
+				Text:   meta.Text,
+				Source: meta.Source,
+				Vector: vec,
+			})
+		}
+		fmt.Printf("\rProgress: %.1f%% (%d/%d chunks)", float64(end)/float64(len(textsToEmbed))*100, end, len(textsToEmbed))
+	}
+	fmt.Println("\nDone.")
+
+	return nil
+}
+
+func (e *Engine) Search(ctx context.Context, query string, topK int) ([]ScoredChunk, error) {
+	vectors, err := e.embed(ctx, []string{query})
+	if err != nil || len(vectors) == 0 || len(vectors[0]) == 0 {
+		return nil, fmt.Errorf("failed to embed query: %v", err)
+	}
+
+	queryVector := vectors[0]
+	var scores []ScoredChunk
+
+	for _, chunk := range e.Chunks {
+		score := cosineSimilarity(queryVector, chunk.Vector)
+		scores = append(scores, ScoredChunk{Chunk: chunk, Score: score})
+	}
+
+	sort.Slice(scores, func(i, j int) bool {
+		return scores[i].Score > scores[j].Score
+	})
+
+	if len(scores) < topK {
+		topK = len(scores)
+	}
+
+	return scores[:topK], nil
+}
+
+func cosineSimilarity(a, b []float32) float64 {
+	if len(a) != len(b) {
+		return 0
+	}
+	var dot, normA, normB float64
+	for i := range a {
+		dot += float64(a[i] * b[i])
+		normA += float64(a[i] * a[i])
+		normB += float64(b[i] * b[i])
+	}
+	if normA == 0 || normB == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(normA) * math.Sqrt(normB))
+}
+
+func chunkText(text string, chunkSize, overlap int) []string {
+	var chunks []string
+	runes := []rune(text)
+	for i := 0; i < len(runes); i += (chunkSize - overlap) {
+		end := i + chunkSize
+		if end > len(runes) {
+			end = len(runes)
+		}
+		chunks = append(chunks, string(runes[i:end]))
+		if end == len(runes) {
+			break
+		}
+	}
+	return chunks
+}
+
+func cleanText(s string) string {
+	s = strings.ReplaceAll(s, "\t", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = regexp.MustCompile(`\n{2,}`).ReplaceAllString(s, "\n")
+	s = regexp.MustCompile(` {2,}`).ReplaceAllString(s, " ")
+	return strings.TrimSpace(s)
+}
