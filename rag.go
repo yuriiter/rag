@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"os"
@@ -113,57 +115,59 @@ func (e *Engine) Ingest(ctx context.Context, sources []string, chunkSize, overla
 		return fmt.Errorf("no valid files or URLs found")
 	}
 
-	var textsToEmbed []string
-	var mapIndexToMeta []struct{ Text, Source string }
-	sourceMTime := make(map[string]int64)
+	type pendingChunk struct {
+		Hash   string
+		Source string
+		Text   string
+	}
+
+	var pending []pendingChunk
 
 	for i, target := range targets {
-		var mtime int64
-		if strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://") {
-			mtime = 0
-		} else {
-			info, err := os.Stat(target)
-			if err != nil {
-				continue
-			}
-			mtime = info.ModTime().UnixNano()
-		}
-		sourceMTime[target] = mtime
+		progress(fmt.Sprintf("Reading %s (%d/%d)...", filepath.Base(target), i+1, len(targets)))
 
-		cachedChunks, ok := loadCache(target, mtime)
-		if ok {
-			progress(fmt.Sprintf("Loading %s from cache (%d/%d)...", filepath.Base(target), i+1, len(targets)))
-			e.Chunks = append(e.Chunks, cachedChunks...)
-			continue
-		}
-
-		progress(fmt.Sprintf("Extracting %s (%d/%d)...", filepath.Base(target), i+1, len(targets)))
 		content, err := ExtractContent(target)
-		if err != nil {
+		if err != nil || content == "" {
 			continue
 		}
-
 		content = cleanText(content)
-		if content == "" {
+
+		hashBytes := sha256.Sum256([]byte(content))
+		contentHash := hex.EncodeToString(hashBytes[:])
+
+		cachedChunks, ok := loadCache(contentHash)
+		if ok {
+			progress(fmt.Sprintf("Loading %s from cache...", filepath.Base(target)))
+			for _, cc := range cachedChunks {
+				cc.Source = target
+				e.Chunks = append(e.Chunks, cc)
+			}
 			continue
 		}
 
 		chunks := chunkText(content, chunkSize, overlap)
 		for _, c := range chunks {
-			textsToEmbed = append(textsToEmbed, c)
-			mapIndexToMeta = append(mapIndexToMeta, struct{ Text, Source string }{Text: c, Source: target})
+			pending = append(pending, pendingChunk{
+				Hash:   contentHash,
+				Source: target,
+				Text:   c,
+			})
 		}
 	}
 
-	if len(textsToEmbed) == 0 {
+	if len(pending) == 0 {
 		if len(e.Chunks) == 0 {
-			return fmt.Errorf("no text content extracted from sources")
+			return fmt.Errorf("no valid text content extracted")
 		}
 		return nil
 	}
 
 	batchSize := 100
-	newChunksBySource := make(map[string][]Chunk)
+	newChunksByHash := make(map[string][]Chunk)
+	var textsToEmbed []string
+	for _, p := range pending {
+		textsToEmbed = append(textsToEmbed, p.Text)
+	}
 
 	for i := 0; i < len(textsToEmbed); i += batchSize {
 		end := i + batchSize
@@ -183,20 +187,23 @@ func (e *Engine) Ingest(ctx context.Context, sources []string, chunkSize, overla
 			if len(vec) == 0 {
 				continue
 			}
-			meta := mapIndexToMeta[i+j]
+			p := pending[i+j]
 			newChunk := Chunk{
-				Text:   meta.Text,
-				Source: meta.Source,
+				Text:   p.Text,
+				Source: p.Source,
 				Vector: vec,
 			}
 			e.Chunks = append(e.Chunks, newChunk)
-			newChunksBySource[meta.Source] = append(newChunksBySource[meta.Source], newChunk)
+
+			cacheChunk := newChunk
+			cacheChunk.Source = ""
+			newChunksByHash[p.Hash] = append(newChunksByHash[p.Hash], cacheChunk)
 		}
 	}
 
 	progress("Saving vectors to local cache...")
-	for src, chunks := range newChunksBySource {
-		saveCache(src, sourceMTime[src], chunks)
+	for hash, chunks := range newChunksByHash {
+		saveCache(hash, chunks)
 	}
 
 	return nil

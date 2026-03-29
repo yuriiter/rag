@@ -1,16 +1,13 @@
 package main
 
 import (
-	"crypto/sha256"
 	"encoding/gob"
-	"encoding/hex"
 	"os"
 	"path/filepath"
 )
 
 type CacheEntry struct {
-	ModTime int64
-	Chunks  []Chunk
+	Chunks []Chunk
 }
 
 func getCacheDir() string {
@@ -23,14 +20,12 @@ func getCacheDir() string {
 	return path
 }
 
-func getCachePath(source string) string {
-	hash := sha256.Sum256([]byte(source))
-	filename := hex.EncodeToString(hash[:]) + ".gob"
-	return filepath.Join(getCacheDir(), filename)
+func getCachePath(contentHash string) string {
+	return filepath.Join(getCacheDir(), contentHash+".gob")
 }
 
-func loadCache(source string, currentMTime int64) ([]Chunk, bool) {
-	path := getCachePath(source)
+func loadCache(contentHash string) ([]Chunk, bool) {
+	path := getCachePath(contentHash)
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, false
@@ -42,15 +37,11 @@ func loadCache(source string, currentMTime int64) ([]Chunk, bool) {
 		return nil, false
 	}
 
-	if entry.ModTime != currentMTime {
-		return nil, false
-	}
-
 	return entry.Chunks, true
 }
 
-func saveCache(source string, mtime int64, chunks []Chunk) error {
-	path := getCachePath(source)
+func saveCache(contentHash string, chunks []Chunk) error {
+	path := getCachePath(contentHash)
 	f, err := os.Create(path)
 	if err != nil {
 		return err
@@ -58,8 +49,7 @@ func saveCache(source string, mtime int64, chunks []Chunk) error {
 	defer f.Close()
 
 	entry := CacheEntry{
-		ModTime: mtime,
-		Chunks:  chunks,
+		Chunks: chunks,
 	}
 	return gob.NewEncoder(f).Encode(entry)
 }
